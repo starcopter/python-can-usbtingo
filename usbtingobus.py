@@ -55,6 +55,12 @@ class USBtingoBus(BusABC):
     
     TIMESTAMP_FACTOR = 100000
 
+    # Upper bound (seconds) for a blocking send (``timeout=None``) to wait for a
+    # TX confirmation. A confirmation can be lost (see the marker resync in
+    # ``usbtransfer_ep3in_callback``) or never arrive if the frame is not ACKed on
+    # the bus; without a cap the sender would block forever.
+    BLOCKING_SEND_TIMEOUT = 1.0
+
     CMD_GET_DEVICEINFO = 0x03
     CMD_SET_PROTOCOL = 0x04
     CMD_SET_BAUDRATE = 0x05
@@ -335,7 +341,14 @@ class USBtingoBus(BusABC):
                     break
 
         if timeout != 0:
-            if not txconfirmation.wait_confirmed(timeout):
+            # ``timeout=None`` means "block" in python-can. Waiting forever on a TX
+            # confirmation is unsafe: the confirmation may be lost or the frame may
+            # never be ACKed on the bus, wedging the caller (and any thread that
+            # forwards into this bus, e.g. ``can.bridge``) indefinitely. Cap the
+            # blocking wait and treat a missing confirmation as best effort -- the
+            # frame is already queued and submitted to the adapter's TX path.
+            wait_timeout = self.BLOCKING_SEND_TIMEOUT if timeout is None else timeout
+            if not txconfirmation.wait_confirmed(wait_timeout) and timeout is not None:
                 raise CanTimeoutError()
 
 
