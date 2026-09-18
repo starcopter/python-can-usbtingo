@@ -100,3 +100,50 @@ def test_event_thread_stop_interrupts_libusb_event_loop():
 
     assert thread.running is False
     bus.ctx.interruptEventHandler.assert_called_once()
+
+
+def test_shutdown_stops_callbacks_before_recording_stop():
+    bus = _bus()
+    seen = {}
+
+    def recording_stop():
+        seen["running"] = bus.running
+
+    bus.recording_stop = recording_stop
+
+    bus.shutdown()
+
+    assert seen["running"] is False
+
+
+def test_recording_stop_does_not_wait_forever_for_last_packet(monkeypatch):
+    bus = _bus()
+    bus.recordingActive = True
+    bus.logicoutfile = MagicMock()
+    bus.logicoutfilename = "capture.sr"
+    bus.samplingrate = 1000
+    bus.usbhandle.controlRead.return_value = b"\x00\x00\x00\x00"
+    waits = []
+
+    class FakeEvent:
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return False
+
+    monkeypatch.setattr("usbtingobus.threading.Event", FakeEvent)
+    monkeypatch.setattr("usbtingobus.zipfile.ZipFile", MagicMock())
+
+    bus.recording_stop()
+
+    assert waits == [2.0]
+
+
+def test_shutdown_skips_usb_teardown_if_event_thread_stays_alive():
+    bus = _bus()
+    bus.eventthread.is_alive = MagicMock(return_value=True)
+
+    bus.shutdown()
+
+    bus.usbhandle.controlWrite.assert_not_called()
+    bus.usbdev.close.assert_not_called()
+    bus.ctx.close.assert_not_called()

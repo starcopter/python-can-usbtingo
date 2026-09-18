@@ -30,6 +30,9 @@ import logging
 
 log = logging.getLogger(__name__)
 
+# Upper bound for teardown waits (last recording packet, libusb event-thread join).
+USB_SHUTDOWN_TIMEOUT_S = 2.0
+
 # fmt: off
 _STATIC_TIMING = {
     (1_000_000, 5_000_000, 87.5): BitTimingFd(
@@ -297,17 +300,26 @@ class USBtingoBus(BusABC):
         Cleanup and shutdown bus.
         """
         super().shutdown()
-        self.recording_stop()
         self.running = False
+        try:
+            self.recording_stop()
+        except (usb1.USBError, CanOperationError):
+            log.debug("USBtingo recording stop failed during shutdown", exc_info=True)
         self._cancel_usb_transfers()
-        self.eventthread.stop()
-        self.eventthread.join(timeout=2.0)
+        if not self._stop_usb_event_thread():
+            log.warning(
+                "USBtingo USB event thread did not stop; skipping SET_MODE and USB close"
+            )
+            return
         try:
             self.command_write(self.CMD_SET_MODE, 0)
         except usb1.USBError:
             log.debug("USBtingo SET_MODE OFF failed during shutdown", exc_info=True)
-        self.usbdev.close()
-        self.ctx.close()
+        try:
+            self.usbdev.close()
+            self.ctx.close()
+        except usb1.USBError:
+            log.debug("USBtingo USB close failed during shutdown", exc_info=True)
 
     def _cancel_usb_transfers(self):
         """Cancel in-flight USB transfers so the event thread can drain and exit."""
@@ -320,6 +332,22 @@ class USBtingoBus(BusABC):
                     pass
                 except usb1.USBError:
                     log.debug("Failed to cancel USB transfer during shutdown", exc_info=True)
+
+    def _stop_usb_event_thread(self) -> bool:
+        """Stop the libusb event thread. Return True if it has exited."""
+        thread = getattr(self, "eventthread", None)
+        if thread is None:
+            return True
+        join_timeout = USB_SHUTDOWN_TIMEOUT_S / 2.0
+        for _ in range(2):
+            thread.stop()
+            try:
+                thread.join(timeout=join_timeout)
+            except RuntimeError:
+                break
+            if not thread.is_alive():
+                return True
+        return not thread.is_alive()
 
     def send(self, msg: Message, timeout: Optional[float] = None) -> None:
         """
@@ -623,8 +651,8 @@ class USBtingoBus(BusABC):
         
         self.command_write(self.CMD_LOGIC_SETCONFIG, 0)
 
-        # wait until last packet was received
-        self.recordingShutdown.wait()
+        # wait until last packet was received (bounded so shutdown cannot hang)
+        self.recordingShutdown.wait(timeout=USB_SHUTDOWN_TIMEOUT_S)
         self.recordingShutdown = None
 
         for transfer in self.ep2in_transfer:
@@ -807,6 +835,7 @@ class USBtingoUSBEventHandler(threading.Thread):
         threading.Thread.__init__(self)
         self.tingo = tingo
         self.running = True
+        self.daemon = True
 
     def run(self):
         while self.running:
