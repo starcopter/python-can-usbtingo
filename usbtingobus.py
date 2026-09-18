@@ -299,11 +299,27 @@ class USBtingoBus(BusABC):
         super().shutdown()
         self.recording_stop()
         self.running = False
+        self._cancel_usb_transfers()
         self.eventthread.stop()
-        self.command_write(self.CMD_SET_MODE, 0)
-        self.eventthread.join()
+        self.eventthread.join(timeout=2.0)
+        try:
+            self.command_write(self.CMD_SET_MODE, 0)
+        except usb1.USBError:
+            log.debug("USBtingo SET_MODE OFF failed during shutdown", exc_info=True)
         self.usbdev.close()
-        self.ctx.close()            
+        self.ctx.close()
+
+    def _cancel_usb_transfers(self):
+        """Cancel in-flight USB transfers so the event thread can drain and exit."""
+        for name in ("ep1in_transfer", "ep2in_transfer", "ep3in_transfer", "ep3out_transfer"):
+            for transfer in getattr(self, name, []):
+                try:
+                    if transfer.isSubmitted():
+                        transfer.cancel()
+                except usb1.USBErrorNotFound:
+                    pass
+                except usb1.USBError:
+                    log.debug("Failed to cancel USB transfer during shutdown", exc_info=True)
 
     def send(self, msg: Message, timeout: Optional[float] = None) -> None:
         """
@@ -443,12 +459,16 @@ class USBtingoBus(BusABC):
             bytelen = (1 + msglength) * 4
             packet = packet[bytelen:]
 
-        return True
+        return self.running
 
     def usbtransfer_ep3out_callback(self, t):
         """
         Complete callback for EP3OUT USB transfers. This is the sending pipe.
         """
+        if not self.running:
+            t.inuse = False
+            return False
+
         buffer = self.tx_prepareBuffer()
         if len(buffer) > 0:
             t.setBuffer(buffer)
@@ -641,7 +661,7 @@ class USBtingoBus(BusABC):
         for i in range(startposition, length):
             self.logicoutfile.write(self.LR_LUT[data[i]])
                 
-        return True
+        return self.running and self.recordingActive
 
     def usbtransfer_ep1in_callback(self, t):
         """
@@ -650,13 +670,13 @@ class USBtingoBus(BusABC):
         """
         data = t.getBuffer()
         if data[0] != 0x80:
-            return True
+            return self.running
 
         report = USBtingoStatusreport(data[:32])
         for listener in self.statusreport_listeners:
             listener(report)
                 
-        return True
+        return self.running
 
     def statusreport_listener_add(self, func):
         """
@@ -790,9 +810,19 @@ class USBtingoUSBEventHandler(threading.Thread):
 
     def run(self):
         while self.running:
-            self.tingo.ctx.handleEvents()
+            try:
+                self.tingo.ctx.handleEvents()
+            except usb1.USBErrorInterrupted:
+                pass
+
     def stop(self):
         self.running = False
+        interrupt = getattr(self.tingo.ctx, "interruptEventHandler", None)
+        if callable(interrupt):
+            try:
+                interrupt()
+            except usb1.USBError:
+                pass
 
 
 
